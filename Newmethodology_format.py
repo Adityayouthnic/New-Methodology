@@ -715,9 +715,42 @@ listings report) go in the "Mapping Sheet" folder instead, not here.
 """
 
 
+MAPPING_SHEET_README_TEXT = """\
+This "Mapping Sheet" folder was auto-created because it was missing.
+
+Drop the reference/mapping files in here, then re-run the pipeline.
+These files change rarely — update them only when the mapping itself changes.
+
+Required files:
+
+  1. Channel listing mapping
+     Filename contains "channel_listing_mapping", extension .zip
+     (a ZIP containing one CSV with columns: Channel Name,
+     Channel Listing SKU Code, Product SkuCode, Product Category)
+
+  2. Myntra seller listings report
+     Filename contains "seller_listings_report", extension .csv
+     (columns: sku code, van)
+
+Without these files, Flipkart/OMSguru rows won't be enriched with
+Product Sku Code / Category, and Myntra SOR, Myntra SJIT, and Cocoblu FC
+rows will all be skipped.
+
+Daily sales-data files go in the "Source" folder instead, not here.
+"""
+
+
+def _create_folder_with_readme(folder: Path, readme_text: str) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "README.txt").write_text(readme_text, encoding="utf-8")
+
+
 def create_source_folder_with_readme(source_dir: Path) -> None:
-    source_dir.mkdir(parents=True, exist_ok=True)
-    (source_dir / "README.txt").write_text(SOURCE_README_TEXT, encoding="utf-8")
+    _create_folder_with_readme(source_dir, SOURCE_README_TEXT)
+
+
+def create_mapping_sheet_folder_with_readme(lookup_dir: Path) -> None:
+    _create_folder_with_readme(lookup_dir, MAPPING_SHEET_README_TEXT)
 
 
 # ---------------- Entry point ----------------
@@ -759,7 +792,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
     if not lookup_dir.is_dir():
-        logging.warning("Lookup folder missing: %s — SOR output will be skipped.", lookup_dir)
+        create_mapping_sheet_folder_with_readme(lookup_dir)
+        logging.warning(
+            "Mapping Sheet folder was missing — created it at %s with a README.txt "
+            "listing required files. Flipkart/OMSguru enrichment, Myntra SOR, Myntra "
+            "SJIT, and Cocoblu FC will all be skipped until those files are added.",
+            lookup_dir,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sources = discover_sources(source_dir, lookup_dir)
