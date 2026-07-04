@@ -26,6 +26,12 @@ Output:
       New methodology master - <YYYY-MM-DD>.csv
       (Flipkart + OMSguru master rows, with Myntra SOR/SJIT/Cocoblu rows appended below.)
 
+  After a successful write, each Source file that was actually used gets moved
+  into Source/Old/<YYYY-MM-DD>/ (created if missing) so Source stays clean for
+  the next run. Files belonging to a section that failed this run are left in
+  place so re-running after a fix will pick them up again. Nothing is deleted —
+  old batches under Source/Old/ can be cleaned up manually whenever you like.
+
 Run:
     python Newmethodology_format.py
     python Newmethodology_format.py --source ./Source --lookup "./Mapping Sheet" --output .
@@ -36,9 +42,10 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import shutil
 import sys
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -335,14 +342,14 @@ def enrich_flipkart_rows(master: pd.DataFrame, mapping_zip: Path) -> pd.DataFram
     return fill_blanks(merged)
 
 
-def build_master(sources: dict) -> Optional[pd.DataFrame]:
+def build_master(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
     pieces: list[pd.DataFrame] = []
     pieces.extend(process_flipkart(p) for p in sources["flipkart"])
     pieces.extend(process_omsguru(p) for p in sources["omsguru"])
 
     if not pieces:
         logging.info("No Flipkart/OMSguru inputs — skipping master output.")
-        return None
+        return None, []
 
     master = fill_blanks(pd.concat(pieces, ignore_index=True))
 
@@ -351,18 +358,19 @@ def build_master(sources: dict) -> Optional[pd.DataFrame]:
     else:
         logging.info("No mapping ZIP — master output not enriched.")
 
-    return master
+    used_files = list(sources["flipkart"]) + list(sources["omsguru"])
+    return master, used_files
 
 
 # ---------------- Myntra SOR ----------------
-def process_sor(sources: dict) -> Optional[pd.DataFrame]:
+def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
     missing = [
         key for key in ("sor_sales", "seller", "mapping_zip") if not sources[key]
     ]
     if missing:
         logging.info("SOR inputs missing (%s) — skipping Myntra SOR rows.",
                      ", ".join(missing))
-        return None
+        return None, []
 
     logging.info("SOR sales: %s", sources["sor_sales"].name)
     df = clean_cols(pd.read_csv(sources["sor_sales"], low_memory=False))
@@ -412,7 +420,7 @@ def process_sor(sources: dict) -> Optional[pd.DataFrame]:
         )
     logging.info("SOR qty verified: %s", output_qty_total)
 
-    return fill_blanks(final)
+    return fill_blanks(final), [sources["sor_sales"]]
 
 
 # ---------------- Myntra SJIT ----------------
@@ -497,12 +505,13 @@ def process_sjit_file(
     return fill_blanks(grouped)
 
 
-def process_sjit(sources: dict) -> Optional[pd.DataFrame]:
+def process_sjit(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
     if not sources["mapping_zip"]:
         logging.info("Mapping ZIP missing — skipping all SJIT rows.")
-        return None
+        return None, []
 
     pieces: list[pd.DataFrame] = []
+    used_files: list[Path] = []
     for variant in SJIT_VARIANTS:
         sjit_path = sources.get(variant["source_key"])
         if not sjit_path:
@@ -515,12 +524,13 @@ def process_sjit(sources: dict) -> Optional[pd.DataFrame]:
             lookup_channel=variant["lookup_channel"],
             label=variant["label"],
         )
+        used_files.append(sjit_path)
         if result is not None and not result.empty:
             pieces.append(result)
 
     if not pieces:
-        return None
-    return fill_blanks(pd.concat(pieces, ignore_index=True))
+        return None, used_files
+    return fill_blanks(pd.concat(pieces, ignore_index=True)), used_files
 
 
 # ---------------- Cocoblu FC (Amazon Vendor) ----------------
@@ -566,17 +576,17 @@ def _cocoblu_omsguru_qty_by_date_asin(omsguru_paths: list[Path]) -> pd.DataFrame
     return combined.groupby(["Date", "ASIN"], as_index=False, dropna=False)["OmsQty"].sum()
 
 
-def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
+def process_cocoblu_fc(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
     fc_files = sources.get("cocoblu_fc") or []
     if not fc_files:
         logging.info("No Cocoblu FC (Sales_ASIN_*) files — skipping.")
-        return None
+        return None, []
     if not sources["mapping_zip"]:
         logging.info("Mapping ZIP missing — skipping Cocoblu FC.")
-        return None
+        return None, []
     if not sources["omsguru"]:
         logging.info("OMSguru missing — cannot compute Cocoblu FC qty (needs OMSguru Cocoblu).")
-        return None
+        return None, []
 
     # Reject duplicate dates across Sales_ASIN_* files before doing any work.
     by_date: dict[pd.Timestamp, Path] = {}
@@ -597,7 +607,7 @@ def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
     cocoblu_dates = set(oms_qty["Date"].dropna().unique())
     if not cocoblu_dates:
         logging.info("Cocoblu FC: OMSguru has no VB EXPORT - Cocoblu rows — skipping all FC files.")
-        return None
+        return None, []
     logging.info("Cocoblu FC: OMSguru covers %d Cocoblu date(s).", len(cocoblu_dates))
 
     logging.info("Cocoblu FC mapping ZIP: %s", sources["mapping_zip"].name)
@@ -609,6 +619,7 @@ def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
     ].drop_duplicates(subset=["Channel Listing SKU Code"])
 
     pieces: list[pd.DataFrame] = []
+    used_files: list[Path] = []
     for fc_path in fc_files:
         file_date = _cocoblu_date_from_filename(fc_path)
         if file_date is None:
@@ -621,6 +632,7 @@ def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
             )
             continue
         logging.info("Cocoblu FC: %s (date=%s)", fc_path.name, file_date.date())
+        used_files.append(fc_path)
 
         # First row is metadata banner; second row is the real header.
         df = pd.read_csv(fc_path, skiprows=1, low_memory=False)
@@ -669,7 +681,7 @@ def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
 
     if not pieces:
         logging.info("Cocoblu FC: no positive-FC rows after subtraction — nothing to add.")
-        return None
+        return None, used_files
 
     combined = pd.concat(pieces, ignore_index=True)
     grouped = combined.groupby(
@@ -678,7 +690,7 @@ def process_cocoblu_fc(sources: dict) -> Optional[pd.DataFrame]:
         "Month": "first", "Product Sku Code": "first",
         "Category Name": "first", "Qty": "sum", "Total": "first",
     })
-    return fill_blanks(grouped)
+    return fill_blanks(grouped), used_files
 
 
 SOURCE_README_TEXT = """\
@@ -712,6 +724,11 @@ Required files:
 
 Reference/mapping files (channel listing mapping ZIP, Myntra seller
 listings report) go in the "Mapping Sheet" folder instead, not here.
+
+After each successful run, files that were used get moved into
+Source/Old/<run-date>/ automatically, so this folder stays clean for the
+next day. Old batches are never auto-deleted — clean them up manually
+whenever you like.
 """
 
 
@@ -751,6 +768,21 @@ def create_source_folder_with_readme(source_dir: Path) -> None:
 
 def create_mapping_sheet_folder_with_readme(lookup_dir: Path) -> None:
     _create_folder_with_readme(lookup_dir, MAPPING_SHEET_README_TEXT)
+
+
+def archive_used_files(source_dir: Path, used_files: list[Path], run_date: date) -> None:
+    """Move successfully processed Source files into Source/Old/<run_date>/."""
+    existing = [p for p in used_files if p.exists()]
+    if not existing:
+        return
+    old_dir = source_dir / "Old" / f"{run_date:%Y-%m-%d}"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    for path in existing:
+        dest = old_dir / path.name
+        if dest.exists():
+            dest = old_dir / f"{path.stem}__{datetime.now():%H%M%S}{path.suffix}"
+        shutil.move(str(path), str(dest))
+        logging.info("Archived: %s -> Source/Old/%s/%s", path.name, run_date, dest.name)
 
 
 # ---------------- Entry point ----------------
@@ -811,31 +843,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     sor_df: Optional[pd.DataFrame] = None
     sjit_df: Optional[pd.DataFrame] = None
     cocoblu_fc_df: Optional[pd.DataFrame] = None
+    used_files: list[Path] = []
 
     # --- Master marketplace consolidation (Flipkart + OMSguru) ---
     try:
-        master_df = build_master(sources)
+        master_df, master_used = build_master(sources)
+        used_files.extend(master_used)
     except Exception:
         logging.exception("Master marketplace build failed")
         exit_code = 1
 
     # --- Myntra SOR (returns rows already shaped to MASTER_COLUMNS) ---
     try:
-        sor_df = process_sor(sources)
+        sor_df, sor_used = process_sor(sources)
+        used_files.extend(sor_used)
     except Exception:
         logging.exception("Myntra SOR build failed")
         exit_code = 1
 
     # --- Myntra SJIT (returns rows already shaped to MASTER_COLUMNS) ---
     try:
-        sjit_df = process_sjit(sources)
+        sjit_df, sjit_used = process_sjit(sources)
+        used_files.extend(sjit_used)
     except Exception:
         logging.exception("Myntra SJIT build failed")
         exit_code = 1
 
     # --- Cocoblu FC (Amazon Vendor leftover after OMSguru Cocoblu) ---
     try:
-        cocoblu_fc_df = process_cocoblu_fc(sources)
+        cocoblu_fc_df, cocoblu_used = process_cocoblu_fc(sources)
+        used_files.extend(cocoblu_used)
     except Exception:
         logging.exception("Cocoblu FC build failed")
         exit_code = 1
@@ -862,6 +899,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     final_path = output_dir / final_output_name()
     combined.to_csv(final_path, index=False)
     logging.info("Final output written: %s (%d rows)", final_path.name, len(combined))
+
+    archive_used_files(source_dir, used_files, date.today())
 
     logging.info("Done (exit=%d)", exit_code)
     return exit_code
