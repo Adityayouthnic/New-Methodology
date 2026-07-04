@@ -1,3 +1,8 @@
 source/
 Mapping Sheet/
 *.csv
+*.exe
+build/
+dist/
+.buildenv/
+*.spec
