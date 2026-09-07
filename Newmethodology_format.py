@@ -10,6 +10,7 @@ Folder layout:
       - Flipkart-*.xlsx / Flipkart-*.csv        → Flipkart sales (FBF sale rows)
       - 3299-*.csv (non-zip)                    → OMSguru order info
       - *Sales_Report_7568*.csv                 → Myntra SOR sales report
+      - *Sales_Report_89075*.csv                → Myntra SOR 2 sales report
       - *Seller_Orders_Report_45833*.csv        → Myntra SJIT (Ethnic Junction)
       - *Seller_Orders_Report_10708*.csv        → Myntra SJIT (VB Export)
       - *ASIN_Manufacturing_Retail_India_Daily*.csv → Cocoblu FC daily (Amazon Vendor)
@@ -17,7 +18,7 @@ Folder layout:
       - 3299-channel_listing_mapping*.zip → Channel listing mapping
       - *Seller_Listings_Report*.csv      → Myntra seller listings (VAN lookup)
 
-  The report-ID numbers above (7568 / 45833 / 10708) are the stable anchors —
+  The report-ID numbers above (7568 / 89075 / 45833 / 10708) are the stable anchors —
   the rest of each filename (dates, prefixes, IDs) can vary run to run.
 
 Output:
@@ -167,6 +168,7 @@ def read_lookup_zip(zip_path: Path, *, required: bool = False) -> Optional[pd.Da
 # are the stable part each portal's export always contains, so detection keys
 # off them instead of a fixed prefix like "EJSJIT"/"VBSJIT"/"SOR".
 SOR_SALES_MARKER = "sales_report_7568"
+SOR2_SALES_MARKER = "sales_report_89075"
 EJSJIT_MARKER = "seller_orders_report_45833"
 VBSJIT_MARKER = "seller_orders_report_10708"
 COCOBLU_FC_MARKER = "asin_manufacturing_retail_india_daily"
@@ -193,6 +195,13 @@ def discover_sources(source_dir: Path, lookup_dir: Path) -> dict:
     sor_sales = next(
         (p for p in source_files
          if SOR_SALES_MARKER in p.name.lower()
+         and p.suffix.lower() == ".csv"),
+        None,
+    )
+
+    sor2_sales = next(
+        (p for p in source_files
+         if SOR2_SALES_MARKER in p.name.lower()
          and p.suffix.lower() == ".csv"),
         None,
     )
@@ -235,6 +244,7 @@ def discover_sources(source_dir: Path, lookup_dir: Path) -> dict:
         "flipkart": flipkart,
         "omsguru": omsguru,
         "sor_sales": sor_sales,
+        "sor2_sales": sor2_sales,
         "ejsjit_orders": ejsjit_orders,
         "vbsjit_orders": vbsjit_orders,
         "cocoblu_fc": cocoblu_fc,
@@ -363,17 +373,29 @@ def build_master(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
 
 
 # ---------------- Myntra SOR ----------------
-def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
-    missing = [
-        key for key in ("sor_sales", "seller", "mapping_zip") if not sources[key]
-    ]
-    if missing:
-        logging.info("SOR inputs missing (%s) — skipping Myntra SOR rows.",
-                     ", ".join(missing))
-        return None, []
+SOR_VARIANTS = (
+    {
+        "source_key": "sor_sales",
+        "label": "SOR",
+        "output_channel": "Myntra-SOR",
+    },
+    {
+        "source_key": "sor2_sales",
+        "label": "SOR 2",
+        "output_channel": "Myntra-SOR 2",
+    },
+)
 
-    logging.info("SOR sales: %s", sources["sor_sales"].name)
-    df = clean_cols(pd.read_csv(sources["sor_sales"], low_memory=False))
+
+def process_sor_file(
+    sor_path: Path,
+    seller_path: Path,
+    mapping_zip: Path,
+    output_channel: str,
+    label: str,
+) -> pd.DataFrame:
+    logging.info("%s sales: %s", label, sor_path.name)
+    df = clean_cols(pd.read_csv(sor_path, low_memory=False))
     original_qty_total = df["qty"].sum()
 
     # ord_month is YYYYMMDD
@@ -383,14 +405,14 @@ def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
         format="%d-%m-%Y",
     )
 
-    logging.info("Seller listings: %s", sources["seller"].name)
-    seller = clean_cols(pd.read_csv(sources["seller"], low_memory=False))
+    logging.info("%s seller listings: %s", label, seller_path.name)
+    seller = clean_cols(pd.read_csv(seller_path, low_memory=False))
     seller_lookup = seller[["sku code", "van"]].drop_duplicates(subset=["sku code"])
     df = df.merge(seller_lookup, left_on="sku_code", right_on="sku code", how="left")
     df = df.rename(columns={"van": "Listing Sku Code"})
 
-    logging.info("Mapping ZIP: %s", sources["mapping_zip"].name)
-    lookup = read_lookup_zip(sources["mapping_zip"], required=True)
+    logging.info("%s mapping ZIP: %s", label, mapping_zip.name)
+    lookup = read_lookup_zip(mapping_zip, required=True)
     lookup = clean_cols(lookup)[
         ["Channel Listing SKU Code", "Product SkuCode", "Product Category"]
     ].drop_duplicates(subset=["Channel Listing SKU Code"])
@@ -407,7 +429,7 @@ def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
         "Date": df["Date"],
         "Product Sku Code": df["Product SkuCode"],
         "Listing Sku Code": df["Listing Sku Code"],
-        "Channel Name": "Myntra-SOR",
+        "Channel Name": output_channel,
         "Category Name": df["Product Category"],
         "Qty": df["qty"],
         "Total": "",
@@ -416,11 +438,46 @@ def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
     output_qty_total = final["Qty"].sum()
     if original_qty_total != output_qty_total:
         raise ValueError(
-            f"SOR qty mismatch — source={original_qty_total}, output={output_qty_total}"
+            f"{label} qty mismatch — source={original_qty_total}, output={output_qty_total}"
         )
-    logging.info("SOR qty verified: %s", output_qty_total)
+    logging.info("%s qty verified: %s", label, output_qty_total)
 
-    return fill_blanks(final), [sources["sor_sales"]]
+    return fill_blanks(final)
+
+
+def process_sor(sources: dict) -> tuple[Optional[pd.DataFrame], list[Path]]:
+    missing_references = [
+        key for key in ("seller", "mapping_zip") if not sources[key]
+    ]
+    if missing_references:
+        logging.info(
+            "SOR reference inputs missing (%s) — skipping all Myntra SOR rows.",
+            ", ".join(missing_references),
+        )
+        return None, []
+
+    pieces: list[pd.DataFrame] = []
+    used_files: list[Path] = []
+    for variant in SOR_VARIANTS:
+        sor_path = sources.get(variant["source_key"])
+        if not sor_path:
+            logging.info("%s input missing — skipping.", variant["label"])
+            continue
+
+        result = process_sor_file(
+            sor_path=sor_path,
+            seller_path=sources["seller"],
+            mapping_zip=sources["mapping_zip"],
+            output_channel=variant["output_channel"],
+            label=variant["label"],
+        )
+        used_files.append(sor_path)
+        if not result.empty:
+            pieces.append(result)
+
+    if not pieces:
+        return None, used_files
+    return fill_blanks(pd.concat(pieces, ignore_index=True)), used_files
 
 
 # ---------------- Myntra SJIT ----------------
@@ -712,13 +769,16 @@ Required files:
   3. Myntra SOR sales report
      Filename contains "Sales_Report_7568", extension .csv
 
-  4. Myntra SJIT — Ethnic Junction
+  4. Myntra SOR 2 sales report
+     Filename contains "Sales_Report_89075", extension .csv
+
+  5. Myntra SJIT — Ethnic Junction
      Filename contains "Seller_Orders_Report_45833", extension .csv
 
-  5. Myntra SJIT — VB Export
+  6. Myntra SJIT — VB Export
      Filename contains "Seller_Orders_Report_10708", extension .csv
 
-  6. Cocoblu FC (Amazon Vendor) daily
+  7. Cocoblu FC (Amazon Vendor) daily
      Filename contains "ASIN_Manufacturing_Retail_India_Daily", extension .csv
      Filename must include a date like "_27-6-2026_" (one file per day)
 
@@ -750,8 +810,8 @@ Required files:
      (columns: sku code, van)
 
 Without these files, Flipkart/OMSguru rows won't be enriched with
-Product Sku Code / Category, and Myntra SOR, Myntra SJIT, and Cocoblu FC
-rows will all be skipped.
+Product Sku Code / Category, and Myntra SOR, Myntra SOR 2, Myntra SJIT,
+and Cocoblu FC rows will all be skipped.
 
 Daily sales-data files go in the "Source" folder instead, not here.
 """
@@ -828,7 +888,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         logging.warning(
             "Mapping Sheet folder was missing — created it at %s with a README.txt "
             "listing required files. Flipkart/OMSguru enrichment, Myntra SOR, Myntra "
-            "SJIT, and Cocoblu FC will all be skipped until those files are added.",
+            "SOR 2, Myntra SJIT, and Cocoblu FC will all be skipped until those files "
+            "are added.",
             lookup_dir,
         )
     output_dir.mkdir(parents=True, exist_ok=True)
